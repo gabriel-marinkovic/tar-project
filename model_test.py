@@ -1,5 +1,6 @@
 import logging
 import numpy as np
+import pandas as pd
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, log_loss
 import torch
@@ -130,20 +131,21 @@ def do_masked_language_modeling(base_model_name, save_dir, train_df, val_df, tes
 def fit_regression(base_model_dir, save_dir, train_df, val_df, test_df):
     model     = AutoModelForSequenceClassification.from_pretrained(base_model_dir, num_labels=1)
     tokenizer = AutoTokenizer.from_pretrained(base_model_dir)
-
+    
     args = TrainingArguments(
         save_dir,
         save_strategy="steps",
         save_steps=500,
         evaluation_strategy="steps",
-        eval_steps=500,
-        num_train_epochs=10,
+        eval_steps=100,
+        num_train_epochs=5,
         warmup_ratio=0.1,
         learning_rate=5e-6,
         per_device_train_batch_size=40,
         per_device_eval_batch_size=128,
         load_best_model_at_end=True,
         metric_for_best_model="mse",
+        disable_tqdm=True
     )
 
     trainer = Trainer(
@@ -162,7 +164,7 @@ def fit_regression(base_model_dir, save_dir, train_df, val_df, test_df):
 
     model.save_pretrained(save_dir)
     tokenizer.save_pretrained(save_dir)
-    return model
+    return model, trainer
 
 
 def fit_model_annotators(base_model_dir, save_dir, train_df, val_df, test_df):
@@ -239,16 +241,419 @@ def fit_model_annotators_binary(base_model_dir, save_dir, train_df, val_df, test
     tokenizer.save_pretrained(save_dir)
     return model
 
+def fit_model_detect_decent(base_model_dir, save_dir, train_df, val_df, test_df):
+    def is_terrible(row):
+        if row["most_common_grade"] == 0 and row["disagreements"] <= 2:
+            return 1
+        else:
+            return 0
+    def is_decent(row):
+        if row["most_common_grade"] >= 2:
+            return 1
+        else:
+            return 0
+        
+    dfs = [train_df, val_df, test_df]
+    for i in range(len(dfs)):
+        #df0 = dfs[i][dfs[i]["disagreements"] == 0]
+        #df1 = dfs[i][dfs[i]["disagreements"] == 1]
+        #df2 = dfs[i][dfs[i]["disagreements"] == 2]
+        #dfs[i] = pd.concat([df0, df1, df2], ignore_index=True)
+        dfs[i]["is_terrible"] = dfs[i].apply(is_terrible, axis=1)
+        dfs[i]["is_decent"]   = dfs[i].apply(is_decent,   axis=1)
+
+        # keep only is_terrible and is_decent rows
+        dfs[i] = dfs[i][dfs[i]["is_terrible"] + dfs[i]["is_decent"] > 0]
+    train_df, val_df, test_df = dfs
+
+    class TerribleDataset(Dataset):
+        def __init__(self, tokenizer, dataframe):
+            self.df = dataframe
+            
+            original = self.df["original_sentence"].tolist()
+            edited   = self.df["edited_sentence"].tolist()
+            #text = [f"{o} [SEP] {e}" for o, e in zip(original, edited)]
+            text = edited
+            output = tokenizer(text=text, truncation=True, padding=True, return_tensors='pt')
+            
+            self.input_ids      = output["input_ids"]
+            self.attention_mask = output["attention_mask"]
+            self.labels         = torch.tensor(self.df['is_decent'].values, dtype=torch.float32)
+        def __len__(self):
+            return len(self.df.index)
+
+        def __getitem__(self, idx):
+            return {
+                "input_ids":      self.input_ids[idx],
+                "attention_mask": self.attention_mask[idx],
+                "labels":         self.labels[idx],
+            }
+
+    def compute_metrics(eval_pred):
+        def maybe(fn):
+            try: return fn()
+            except: return 0.0
+
+        predictions, labels = eval_pred
+        predictions = torch.tensor(predictions).squeeze().double()
+        labels      = torch.tensor(labels)     .squeeze().double()
+
+        bce = torch.nn.BCEWithLogitsLoss()(predictions, labels).item()
+
+        predictions = torch.sigmoid(predictions) > 0.8
+
+        accuracy    = maybe(lambda: torch.sum(predictions == labels).item() / len(labels))
+        precision   = maybe(lambda: torch.sum(predictions * labels).item() / torch.sum(predictions).item())
+        recall      = maybe(lambda: torch.sum(predictions * labels).item() / torch.sum(labels).item())
+        f1          = maybe(lambda: 2 * precision * recall / (precision + recall))
+
+        return {
+            "bce": bce,
+            "acc": accuracy,
+            "p": precision,
+            "r": recall,
+            "f1": f1,
+        }
+
+    model     = AutoModelForSequenceClassification.from_pretrained(base_model_dir, num_labels=1)
+    tokenizer = AutoTokenizer.from_pretrained(base_model_dir)
+
+    args = TrainingArguments(
+        save_dir,
+        save_strategy="steps",
+        save_steps=200,
+        evaluation_strategy="steps",
+        eval_steps=200,
+        num_train_epochs=10,
+        warmup_ratio=0.1,
+        learning_rate=2e-5,
+        per_device_train_batch_size=20,
+        per_device_eval_batch_size=128,
+        load_best_model_at_end=True,
+        metric_for_best_model="f1",
+    )
+
+    # ratio of terrible vs all
+    terrible_count = train_df["is_decent"].sum()
+    not_terrible_count = len(train_df.index) - terrible_count
+    pos_weight = torch.tensor(not_terrible_count / terrible_count)
+    print("positive weight is", pos_weight)
+
+    class CustomTrainer(Trainer):
+        def compute_loss(self, model, inputs, return_outputs=False):
+            labels = inputs.get("labels")
+            outputs = model(**inputs)
+            logits = outputs.get("logits").squeeze()
+            
+            loss_fct = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+            loss = loss_fct(logits, labels)
+            return (loss, outputs) if return_outputs else loss
+    
+    trainer = CustomTrainer(
+        model,
+        args,
+        train_dataset=TerribleDataset(tokenizer, train_df),
+        eval_dataset=TerribleDataset(tokenizer, val_df),
+        compute_metrics=compute_metrics,
+    )
+
+    trainer.train()
+    trainer.evaluate()
+    out = trainer.predict(TerribleDataset(tokenizer, test_df))
+    test_metrics = compute_metrics((out.predictions, out.label_ids))
+    print("test_metrics", test_metrics)
+
+    model.save_pretrained(save_dir)
+    tokenizer.save_pretrained(save_dir)
+    return model
+
+def fit_model_detect_terrible(base_model_dir, save_dir, train_df, val_df, test_df):
+    def is_terrible(row):
+        if row["most_common_grade"] == 0 and row["disagreements"] <= 2:
+            return 1
+        else:
+            return 0
+    def is_decent(row):
+        if row["most_common_grade"] >= 2:
+            return 1
+        else:
+            return 0
+        
+    dfs = [train_df, val_df, test_df]
+    for i in range(len(dfs)):
+        #df0 = dfs[i][dfs[i]["disagreements"] == 0]
+        #df1 = dfs[i][dfs[i]["disagreements"] == 1]
+        #df2 = dfs[i][dfs[i]["disagreements"] == 2]
+        #dfs[i] = pd.concat([df0, df1, df2], ignore_index=True)
+        dfs[i]["is_terrible"] = dfs[i].apply(is_terrible, axis=1)
+        dfs[i]["is_decent"]   = dfs[i].apply(is_decent,   axis=1)
+
+        # keep only is_terrible and is_decent rows
+        dfs[i] = dfs[i][dfs[i]["is_terrible"] + dfs[i]["is_decent"] > 0]
+    train_df, val_df, test_df = dfs
+
+    class TerribleDataset(Dataset):
+        def __init__(self, tokenizer, dataframe):
+            self.df = dataframe
+            
+            original = self.df["original_sentence"].tolist()
+            edited   = self.df["edited_sentence"].tolist()
+            #text = [f"{o} [SEP] {e}" for o, e in zip(original, edited)]
+            text = edited
+            output = tokenizer(text=text, truncation=True, padding=True, return_tensors='pt')
+            
+            self.input_ids      = output["input_ids"]
+            self.attention_mask = output["attention_mask"]
+            self.labels         = torch.tensor(self.df['is_terrible'].values, dtype=torch.float32)
+        def __len__(self):
+            return len(self.df.index)
+
+        def __getitem__(self, idx):
+            return {
+                "input_ids":      self.input_ids[idx],
+                "attention_mask": self.attention_mask[idx],
+                "labels":         self.labels[idx],
+            }
+
+    def compute_metrics(eval_pred):
+        def maybe(fn):
+            try: return fn()
+            except: return 0.0
+
+        predictions, labels = eval_pred
+        predictions = torch.tensor(predictions).squeeze().double()
+        labels      = torch.tensor(labels)     .squeeze().double()
+
+        bce = torch.nn.BCEWithLogitsLoss()(predictions, labels).item()
+
+        predictions = torch.sigmoid(predictions) > 0.8
+
+        accuracy    = maybe(lambda: torch.sum(predictions == labels).item() / len(labels))
+        precision   = maybe(lambda: torch.sum(predictions * labels).item() / torch.sum(predictions).item())
+        recall      = maybe(lambda: torch.sum(predictions * labels).item() / torch.sum(labels).item())
+        f1          = maybe(lambda: 2 * precision * recall / (precision + recall))
+
+        return {
+            "bce": bce,
+            "acc": accuracy,
+            "p": precision,
+            "r": recall,
+            "f1": f1,
+        }
+
+    model     = AutoModelForSequenceClassification.from_pretrained(base_model_dir, num_labels=1)
+    tokenizer = AutoTokenizer.from_pretrained(base_model_dir)
+
+    args = TrainingArguments(
+        save_dir,
+        save_strategy="steps",
+        save_steps=200,
+        evaluation_strategy="steps",
+        eval_steps=200,
+        num_train_epochs=20,
+        warmup_ratio=0.1,
+        learning_rate=2e-5,
+        per_device_train_batch_size=20,
+        per_device_eval_batch_size=128,
+        load_best_model_at_end=True,
+        metric_for_best_model="f1",
+    )
+
+    # ratio of terrible vs all
+    terrible_count = train_df["is_terrible"].sum()
+    not_terrible_count = len(train_df.index) - terrible_count
+    pos_weight = torch.tensor(not_terrible_count / terrible_count)
+    print("positive weight is", pos_weight)
+
+    class CustomTrainer(Trainer):
+        def compute_loss(self, model, inputs, return_outputs=False):
+            labels = inputs.get("labels")
+            outputs = model(**inputs)
+            logits = outputs.get("logits").squeeze()
+            
+            loss_fct = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+            loss = loss_fct(logits, labels)
+            return (loss, outputs) if return_outputs else loss
+    
+    trainer = CustomTrainer(
+        model,
+        args,
+        train_dataset=TerribleDataset(tokenizer, train_df),
+        eval_dataset=TerribleDataset(tokenizer, val_df),
+        compute_metrics=compute_metrics,
+    )
+
+    trainer.train()
+    trainer.evaluate()
+    out = trainer.predict(TerribleDataset(tokenizer, test_df))
+    test_metrics = compute_metrics((out.predictions, out.label_ids))
+    print("test_metrics", test_metrics)
+
+    model.save_pretrained(save_dir)
+    tokenizer.save_pretrained(save_dir)
+    return model
+
+#fit_model_detect_terrible('sentence-transformers/all-MiniLM-L6-v2', './fit_out', *make_base_dataset())
+#fit_model_detect_decent('sentence-transformers/all-MiniLM-L6-v2', './fit_out', *make_base_dataset())
+
+def fit_model_with_preprocessing_model_step(base_model_dir, preprocessing_model_dir, train_df, val_df, test_df):
+    #fit_model_detect_terrible(base_model_dir, preprocessing_model_dir, train_df, val_df, test_df)
+
+    pp_model     = AutoModelForSequenceClassification.from_pretrained(preprocessing_model_dir)
+    pp_tokenizer = AutoTokenizer.from_pretrained(preprocessing_model_dir)
+
+    biases = np.arange(0, 2+0.1, 0.1) / 3
+    #thresholds = np.arange(0.6, 1, 0.1)
+    thresholds = np.array([0.8])
+    for threshold in thresholds:
+
+        def preprocess(df):
+            df_kept      = df.iloc[:0,:].copy()
+            df_discarded = df.iloc[:0,:].copy()
+            
+            for i in range(0, len(df), 1000):
+                rows = df.iloc[i:i+1000]
+                text = rows["edited_sentence"].tolist()
+                tokenized = pp_tokenizer(text=text, truncation=True, padding=True, return_tensors='pt')
+                out = pp_model(**tokenized)
+                logits = out["logits"].squeeze()
+                predictions = (torch.sigmoid(logits) > threshold).numpy()
+
+                df_discarded = pd.concat([df_discarded, rows[predictions]])
+                df_kept      = pd.concat([df_kept,      rows[~predictions]])
+
+                #print("processed {} of {} rows".format(i, len(df)))
+
+            return df_kept, df_discarded
+
+        train_df_kept, train_df_discarded = preprocess(train_df)
+        val_df_kept,   val_df_discarded   = preprocess(val_df)
+        test_df_kept,  test_df_discarded  = preprocess(test_df)
+
+        print("in train, discared {} of {} rows".format(len(train_df_discarded), len(train_df)))
+        print("in val,   discared {} of {} rows".format(len(val_df_discarded),   len(val_df)))
+        print("in test,  discared {} of {} rows".format(len(test_df_discarded),  len(test_df)))
+
+        print("training on rest...")
+
+        train_df_equally_sampled = train_df  #train_df.sample(n=len(train_df_kept), random_state=42)
+        val_df_equally_sampled   = val_df    #val_df.sample(n=len(val_df_kept),     random_state=42)
+        test_df_equally_sampled  = test_df   #test_df.sample(n=len(test_df_kept),   random_state=42)
+        model_regular, trainer_regular = fit_regression(base_model_dir, "./second_model_out_regular", train_df_equally_sampled, val_df_equally_sampled, test_df_equally_sampled)
+        trainer_regular.evaluate()
+
+        model_kept, trainer_kept = fit_regression(base_model_dir, "./second_model_out_kept", train_df_kept, val_df_kept, test_df_kept)
+        trainer_kept.evaluate()
+        
+        tokenizer = AutoTokenizer.from_pretrained(base_model_dir)
+
+        out_regular = trainer_regular.predict(TokenizedSentencesDataset(tokenizer, test_df_kept, "arrow_sentence"))
+        out_kept    = trainer_kept.predict(TokenizedSentencesDataset(tokenizer, test_df_kept, "arrow_sentence"))
+        test_metrics_regular = compute_metrics_regression((out_regular.predictions.squeeze(), out_regular.label_ids.squeeze()))
+        test_metrics_kept    = compute_metrics_regression((out_kept.predictions.squeeze(),    out_kept.label_ids.squeeze()))
+        print(f"KEPT   dataset, randomly sampled model (threshold {threshold}):", test_metrics_regular)
+        print(f"KEPT   dataset, kept-only        model (threshold {threshold}):", test_metrics_kept)
+
+        out_regular = trainer_regular.predict(TokenizedSentencesDataset(tokenizer, test_df, "arrow_sentence"))
+        out_kept    = trainer_kept.predict(TokenizedSentencesDataset(tokenizer, test_df, "arrow_sentence"))
+        test_metrics_regular = compute_metrics_regression((out_regular.predictions.squeeze(), out_regular.label_ids.squeeze()))
+        test_metrics_kept    = compute_metrics_regression((out_kept.predictions.squeeze(),    out_kept.label_ids.squeeze()))
+        print(f"ENTIRE dataset, randomly sampled model (threshold {threshold}):", test_metrics_regular)
+        print(f"ENTIRE dataset, kept-only        model (threshold {threshold}):", test_metrics_kept)
+
+        # compare metrics like above, but for each agreement class separately
+        for disagreement in [0, 1, 2, 3]:
+            try:
+                test_df_kept_disagreement = test_df_kept[test_df_kept["disagreements"] == disagreement]
+                test_df_disagreement      = test_df[test_df["disagreements"] == disagreement]
+                if len(test_df_kept_disagreement) == 0 or len(test_df_disagreement) == 0:
+                    continue
+
+                out_regular = trainer_regular.predict(TokenizedSentencesDataset(tokenizer, test_df_kept_disagreement, "arrow_sentence"))
+                out_kept    = trainer_kept.predict(TokenizedSentencesDataset(tokenizer, test_df_kept_disagreement, "arrow_sentence"))
+                test_metrics_regular = compute_metrics_regression((out_regular.predictions.squeeze(), out_regular.label_ids.squeeze()))
+                test_metrics_kept    = compute_metrics_regression((out_kept.predictions.squeeze(),    out_kept.label_ids.squeeze()))
+                print(f"KEPT   dataset, randomly sampled model, disagreement {disagreement} (threshold {threshold}):", test_metrics_regular)
+                print(f"KEPT   dataset, kept-only        model, disagreement {disagreement} (threshold {threshold}):", test_metrics_kept)
+
+                out_regular = trainer_regular.predict(TokenizedSentencesDataset(tokenizer, test_df_disagreement, "arrow_sentence"))
+                out_kept    = trainer_kept.predict(TokenizedSentencesDataset(tokenizer, test_df_disagreement, "arrow_sentence"))
+                test_metrics_regular = compute_metrics_regression((out_regular.predictions.squeeze(), out_regular.label_ids.squeeze()))
+                test_metrics_kept    = compute_metrics_regression((out_kept.predictions.squeeze(),    out_kept.label_ids.squeeze()))
+                print(f"ENTIRE dataset, randomly sampled model, disagreement {disagreement} (threshold {threshold}):", test_metrics_regular)
+                print(f"ENTIRE dataset, kept-only        model, disagreement {disagreement} (threshold {threshold}):", test_metrics_kept)
+            except Exception as e:
+                print(e)
+
+        # like above, but for a few meanGrade buckets
+        for bucket in [0.25, 0.75, 1.25, 1.75, 2.25, 2.75]:
+            mean_grade_from = bucket - 0.25
+            mean_grade_to   = bucket + 0.25
+
+            test_df_kept_bucket = test_df_kept[(test_df_kept["meanGrade"] >= mean_grade_from) & (test_df_kept["meanGrade"] <= mean_grade_to)]
+            test_df_bucket      = test_df[(test_df["meanGrade"] >= mean_grade_from) & (test_df["meanGrade"] <= mean_grade_to)]
+            if len(test_df_kept_bucket) == 0 or len(test_df_bucket) == 0:
+                continue
+
+            out_regular = trainer_regular.predict(TokenizedSentencesDataset(tokenizer, test_df_kept_bucket, "arrow_sentence"))
+            out_kept    = trainer_kept.predict(TokenizedSentencesDataset(tokenizer, test_df_kept_bucket, "arrow_sentence"))
+            test_metrics_regular = compute_metrics_regression((out_regular.predictions.squeeze(), out_regular.label_ids.squeeze()))
+            test_metrics_kept    = compute_metrics_regression((out_kept.predictions.squeeze(),    out_kept.label_ids.squeeze()))
+            print(f"KEPT   dataset, randomly sampled model, meanGrade {mean_grade_from}-{mean_grade_to} (threshold {threshold}):", test_metrics_regular)
+            print(f"KEPT   dataset, kept-only        model, meanGrade {mean_grade_from}-{mean_grade_to} (threshold {threshold}):", test_metrics_kept)
+
+            out_regular = trainer_regular.predict(TokenizedSentencesDataset(tokenizer, test_df_bucket, "arrow_sentence"))
+            out_kept    = trainer_kept.predict(TokenizedSentencesDataset(tokenizer, test_df_bucket, "arrow_sentence"))
+            test_metrics_regular = compute_metrics_regression((out_regular.predictions.squeeze(), out_regular.label_ids.squeeze()))
+            test_metrics_kept    = compute_metrics_regression((out_kept.predictions.squeeze(),    out_kept.label_ids.squeeze()))
+            print(f"ENTIRE dataset, randomly sampled model, meanGrade {mean_grade_from}-{mean_grade_to} (threshold {threshold}):", test_metrics_regular)
+            print(f"ENTIRE dataset, kept-only        model, meanGrade {mean_grade_from}-{mean_grade_to} (threshold {threshold}):", test_metrics_kept)
+
+
+
+
+
+
+
+
+
+
+        
+##        for bias in biases:
+##            out = trainer_kept.predict(TokenizedSentencesDataset(AutoTokenizer.from_pretrained(base_model_dir), test_df_kept, "arrow_sentence"))
+##
+##            combined_preds  = np.concatenate((out.predictions.squeeze(), np.ones(len(test_df_discarded)) * bias))
+##            combined_labels = np.concatenate((out.label_ids.squeeze(),   test_df_discarded["normalized_score"].to_numpy()))
+##
+##            test_metrics = compute_metrics_regression((combined_labels, combined_preds))
+##            print(f"COMBINED METRICS (bias {bias}, threshold {threshold}):", test_metrics)
+##            
+##            out = trainer_kept.predict(TokenizedSentencesDataset(AutoTokenizer.from_pretrained(base_model_dir), test_df_kept, "arrow_sentence"))
+##            test_metrics = compute_metrics_regression((out.label_ids.squeeze(), out.predictions.squeeze()))
+##            print(f"KEPT METRICS (bias {bias}, threshold {threshold}):", test_metrics)
+##
+##            out = trainer_kept.predict(TokenizedSentencesDataset(AutoTokenizer.from_pretrained(base_model_dir), test_df_discarded, "arrow_sentence"))
+##            test_metrics = compute_metrics_regression((out.label_ids.squeeze(), out.predictions.squeeze()))
+##            print(f"DISCARDED METRICS (bias {bias}, threshold {threshold}):", test_metrics)
+##
+##            out = trainer_kept.predict(TokenizedSentencesDataset(AutoTokenizer.from_pretrained(base_model_dir), test_df, "arrow_sentence"))
+##            test_metrics = compute_metrics_regression((out.label_ids.squeeze(), out.predictions.squeeze()))
+##            print(f"EVALD ON FULL SET (bias {bias}, threshold {threshold}):", test_metrics)
+
+
+fit_model_with_preprocessing_model_step('sentence-transformers/all-MiniLM-L6-v2', './fit_out', *make_base_dataset())
+
+
 def do_full_gpl_run():
     train_df, val_df, test_df = make_base_dataset()
     train_df = load_explanations(train_df, "explanations/chatgpt_train.json", drop_without_explanation=True)
     val_df   = load_explanations(val_df,   "explanations/chatgpt_valid.json", drop_without_explanation=True)
 
-    gpl_dir = "gpl_workingdir_chatgpt_reversed"
+    #gpl_dir = "gpl_workingdir_chatgpt_reversed"
     #prepare_gpl_workingdir(gpl_dir, train_df, val_df, True)
     #train_gpl(gpl_dir, "distilbert-base-uncased")
 
-    fit_model_annotators('bert-base-uncased', './fit_out', train_df, val_df, test_df)
+    fit_regression('sentence-transformers/all-MiniLM-L6-v2', './fit_out', train_df, val_df, test_df)
 
 
 def multiple_regression_by_quantiles():
@@ -282,8 +687,6 @@ def multiple_regression_by_quantiles():
                 "labels":         self.labels[idx],
             }
         
-
-
     def my_metric(eval_pred):
         preds, labels = eval_pred
         preds, labels = preds.squeeze(), labels.squeeze()

@@ -1,7 +1,9 @@
 import logging
 import json
+from collections import Counter
 import pandas as pd
 import numpy as np
+from scipy.stats import iqr
 import torch
 from torch.utils.data import Dataset
 from datasets import load_dataset
@@ -41,6 +43,23 @@ def make_base_dataset():
             lambda row: row["original"].replace("<", "[ ").replace("/>", f" => {row['edit']} ]"),
             axis=1
         )
+
+        # statistics thingies
+        df['grades'] = df['all_scores']
+        df['stddev'] = df['grades'].apply(np.std)
+        df['iqr']    = df['grades'].apply(iqr)
+
+        # make grades_max_5 column, which takes the 5 quantile of the grades
+        df['grades_max_5'] = df['grades'].apply(lambda x: np.quantile(sorted(x), [0.0, 0.25, 0.5, 0.75, 1.0], method='nearest'))
+
+        def disagreements_fn(row):
+            grades = list(row['grades_max_5'])
+            count = Counter(grades)
+            most_common_grade, freq = count.most_common(1)[0]
+            num_disagreements = len(grades) - freq
+            return num_disagreements, most_common_grade if freq > 1 else None
+
+        df['disagreements'], df['most_common_grade'] = zip(*df.apply(disagreements_fn, axis=1))
 
     return train_df, val_df, test_df
 
@@ -83,20 +102,8 @@ class TokenizedSentencesDataset(Dataset):
         self.df = dataframe
         self.score_dims = score_dims
 
-        self.normalized_scores = torch.Tensor(self.df["normalized_score"].tolist()).to(device)
-
-        score_counts = torch.zeros(len(self.df.index), 4).to(device)
-        score_binary = torch.zeros(len(self.df.index), 2).to(device)  
-        for i, scores in self.df["all_scores"].items():
-            for score in scores:
-                score_counts[i, score] += 1
-
-                if score == 0 or score == 1:
-                    score_binary[0] += 1
-                else:
-                    score_binary[1] += 1
-        self.score_counts = score_counts / score_counts.sum(dim=1, keepdim=True)
-        self.score_binary = score_binary / score_binary.sum(dim=1, keepdim=True)
+        #self.normalized_scores = torch.Tensor(self.df["most_common_grade"].to_numpy() / 3).to(device)
+        self.normalized_scores = torch.Tensor(self.df["normalized_score"].to_numpy()).to(device)
 
         original = self.df["original_sentence"].tolist()
         edited   = self.df["edited_sentence"].tolist()
@@ -112,12 +119,7 @@ class TokenizedSentencesDataset(Dataset):
         return len(self.df.index)
 
     def __getitem__(self, idx):
-        if self.score_dims == 1:
-            labels = self.normalized_scores[idx]
-        elif self.score_dims == 2:
-            labels = self.score_binary[idx]
-        else:
-            labels = self.score_counts[idx]
+        labels = self.normalized_scores[idx]
         return {
             "input_ids":      self.input_ids[idx],
             "attention_mask": self.attention_mask[idx],
