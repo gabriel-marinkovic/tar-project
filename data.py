@@ -10,7 +10,8 @@ from datasets import load_dataset
 
 logger = logging.getLogger(__name__)
 
-
+def round_to(n, fraction):
+    return round(n / fraction) * fraction
 
 def make_base_dataset():
     dataset = load_dataset("humicroedit", "subtask-1")
@@ -21,6 +22,7 @@ def make_base_dataset():
 
     dfs = [train_df, test_df, val_df]
     for df in dfs:
+        df['mean_grade_bucket']     = df['meanGrade'].apply(lambda x: round_to(x, 0.5))
         df["normalized_score"]      = df["meanGrade"] / 3.0
         df["all_scores"]            = df["grades"].apply(lambda s: np.array(sorted([int(c) for c in s])))
         df["all_scores_normalized"] = df["all_scores"].apply(lambda s: s / 3)

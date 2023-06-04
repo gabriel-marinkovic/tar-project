@@ -141,11 +141,12 @@ def fit_regression(base_model_dir, save_dir, train_df, val_df, test_df):
         num_train_epochs=5,
         warmup_ratio=0.1,
         learning_rate=5e-6,
-        per_device_train_batch_size=40,
+        weight_decay=0.001,
+        per_device_train_batch_size=20,
         per_device_eval_batch_size=128,
         load_best_model_at_end=True,
         metric_for_best_model="mse",
-        disable_tqdm=True
+        disable_tqdm=True,
     )
 
     trainer = Trainer(
@@ -324,10 +325,11 @@ def fit_model_detect_decent(base_model_dir, save_dir, train_df, val_df, test_df)
         save_steps=200,
         evaluation_strategy="steps",
         eval_steps=200,
-        num_train_epochs=10,
+        num_train_epochs=20,
         warmup_ratio=0.1,
         learning_rate=2e-5,
-        per_device_train_batch_size=20,
+        weight_decay=0.01,
+        per_device_train_batch_size=10,
         per_device_eval_batch_size=128,
         load_best_model_at_end=True,
         metric_for_best_model="f1",
@@ -369,12 +371,14 @@ def fit_model_detect_decent(base_model_dir, save_dir, train_df, val_df, test_df)
 
 def fit_model_detect_terrible(base_model_dir, save_dir, train_df, val_df, test_df):
     def is_terrible(row):
-        if row["most_common_grade"] == 0 and row["disagreements"] <= 2:
+        if row["most_common_grade"] == 0 and row["meanGrade"] <= 1:
+            return 1
+        elif row["most_common_grade"] == 1 and row["meanGrade"] <= 1:
             return 1
         else:
             return 0
     def is_decent(row):
-        if row["most_common_grade"] >= 2:
+        if row["meanGrade"] >= 1.5:
             return 1
         else:
             return 0
@@ -398,8 +402,8 @@ def fit_model_detect_terrible(base_model_dir, save_dir, train_df, val_df, test_d
             
             original = self.df["original_sentence"].tolist()
             edited   = self.df["edited_sentence"].tolist()
-            #text = [f"{o} [SEP] {e}" for o, e in zip(original, edited)]
-            text = edited
+            text = [f"{o} [SEP] {e}" for o, e in zip(original, edited)]
+            #text = edited
             output = tokenizer(text=text, truncation=True, padding=True, return_tensors='pt')
             
             self.input_ids      = output["input_ids"]
@@ -426,7 +430,7 @@ def fit_model_detect_terrible(base_model_dir, save_dir, train_df, val_df, test_d
 
         bce = torch.nn.BCEWithLogitsLoss()(predictions, labels).item()
 
-        predictions = torch.sigmoid(predictions) > 0.8
+        predictions = torch.sigmoid(predictions) > 0.85
 
         accuracy    = maybe(lambda: torch.sum(predictions == labels).item() / len(labels))
         precision   = maybe(lambda: torch.sum(predictions * labels).item() / torch.sum(predictions).item())
@@ -450,13 +454,14 @@ def fit_model_detect_terrible(base_model_dir, save_dir, train_df, val_df, test_d
         save_steps=200,
         evaluation_strategy="steps",
         eval_steps=200,
-        num_train_epochs=20,
+        num_train_epochs=10,
         warmup_ratio=0.1,
         learning_rate=2e-5,
+        weight_decay=0.001,
         per_device_train_batch_size=20,
         per_device_eval_batch_size=128,
         load_best_model_at_end=True,
-        metric_for_best_model="f1",
+        metric_for_best_model="r",
     )
 
     # ratio of terrible vs all
@@ -470,7 +475,9 @@ def fit_model_detect_terrible(base_model_dir, save_dir, train_df, val_df, test_d
             labels = inputs.get("labels")
             outputs = model(**inputs)
             logits = outputs.get("logits").squeeze()
-            
+            if len(logits.shape) == 0:
+                logits = logits.unsqueeze(0)
+
             loss_fct = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
             loss = loss_fct(logits, labels)
             return (loss, outputs) if return_outputs else loss
@@ -497,14 +504,14 @@ def fit_model_detect_terrible(base_model_dir, save_dir, train_df, val_df, test_d
 #fit_model_detect_decent('sentence-transformers/all-MiniLM-L6-v2', './fit_out', *make_base_dataset())
 
 def fit_model_with_preprocessing_model_step(base_model_dir, preprocessing_model_dir, train_df, val_df, test_df):
-    #fit_model_detect_terrible(base_model_dir, preprocessing_model_dir, train_df, val_df, test_df)
+    fit_model_detect_terrible(base_model_dir, preprocessing_model_dir, train_df, val_df, test_df)
 
     pp_model     = AutoModelForSequenceClassification.from_pretrained(preprocessing_model_dir)
     pp_tokenizer = AutoTokenizer.from_pretrained(preprocessing_model_dir)
 
     biases = np.arange(0, 2+0.1, 0.1) / 3
     #thresholds = np.arange(0.6, 1, 0.1)
-    thresholds = np.array([0.8])
+    thresholds = np.array([0.85])
     for threshold in thresholds:
 
         def preprocess(df):
@@ -544,71 +551,82 @@ def fit_model_with_preprocessing_model_step(base_model_dir, preprocessing_model_
 
         model_kept, trainer_kept = fit_regression(base_model_dir, "./second_model_out_kept", train_df_kept, val_df_kept, test_df_kept)
         trainer_kept.evaluate()
-        
+
+        model_discarded, trainer_discarded = fit_regression(base_model_dir, "./second_model_out_discarded", train_df_discarded, val_df_discarded, test_df_discarded)
+        #model_discarded, trainer_discarded = model_regular, trainer_regular
+        trainer_discarded.evaluate()
+
         tokenizer = AutoTokenizer.from_pretrained(base_model_dir)
 
-        out_regular = trainer_regular.predict(TokenizedSentencesDataset(tokenizer, test_df_kept, "arrow_sentence"))
-        out_kept    = trainer_kept.predict(TokenizedSentencesDataset(tokenizer, test_df_kept, "arrow_sentence"))
-        test_metrics_regular = compute_metrics_regression((out_regular.predictions.squeeze(), out_regular.label_ids.squeeze()))
-        test_metrics_kept    = compute_metrics_regression((out_kept.predictions.squeeze(),    out_kept.label_ids.squeeze()))
-        print(f"KEPT   dataset, randomly sampled model (threshold {threshold}):", test_metrics_regular)
-        print(f"KEPT   dataset, kept-only        model (threshold {threshold}):", test_metrics_kept)
-
         out_regular = trainer_regular.predict(TokenizedSentencesDataset(tokenizer, test_df, "arrow_sentence"))
-        out_kept    = trainer_kept.predict(TokenizedSentencesDataset(tokenizer, test_df, "arrow_sentence"))
-        test_metrics_regular = compute_metrics_regression((out_regular.predictions.squeeze(), out_regular.label_ids.squeeze()))
-        test_metrics_kept    = compute_metrics_regression((out_kept.predictions.squeeze(),    out_kept.label_ids.squeeze()))
-        print(f"ENTIRE dataset, randomly sampled model (threshold {threshold}):", test_metrics_regular)
-        print(f"ENTIRE dataset, kept-only        model (threshold {threshold}):", test_metrics_kept)
+
+        out_kept      = trainer_kept     .predict(TokenizedSentencesDataset(tokenizer, test_df_kept,      "arrow_sentence"))
+        out_discarded = trainer_discarded.predict(TokenizedSentencesDataset(tokenizer, test_df_discarded, "arrow_sentence"))
+
+        out_combined_predictions = np.concatenate([out_kept.predictions.squeeze(), out_discarded.predictions.squeeze()])
+        out_combined_label_ids   = np.concatenate([out_kept.label_ids.squeeze(),   out_discarded.label_ids.squeeze()])
+
+        test_metrics_regular  = compute_metrics_regression((out_regular.predictions.squeeze(), out_regular.label_ids.squeeze()))
+        test_metrics_combined = compute_metrics_regression((out_combined_predictions, out_combined_label_ids))
+        print(f"ENTIRE dataset, regular  model  (threshold {threshold}):", test_metrics_regular)
+        print(f"ENTIRE dataset, combined models (threshold {threshold}):", test_metrics_combined)
 
         # compare metrics like above, but for each agreement class separately
         for disagreement in [0, 1, 2, 3]:
-            try:
-                test_df_kept_disagreement = test_df_kept[test_df_kept["disagreements"] == disagreement]
-                test_df_disagreement      = test_df[test_df["disagreements"] == disagreement]
-                if len(test_df_kept_disagreement) == 0 or len(test_df_disagreement) == 0:
+                test_df_disagreement           = test_df[test_df["disagreements"] == disagreement]
+                test_df_kept_disagreement      = test_df_kept[test_df_kept["disagreements"] == disagreement]
+                test_df_discarded_disagreement = test_df[test_df["disagreements"] == disagreement]
+                
+                if len(test_df_disagreement) == 0:
                     continue
-
-                out_regular = trainer_regular.predict(TokenizedSentencesDataset(tokenizer, test_df_kept_disagreement, "arrow_sentence"))
-                out_kept    = trainer_kept.predict(TokenizedSentencesDataset(tokenizer, test_df_kept_disagreement, "arrow_sentence"))
-                test_metrics_regular = compute_metrics_regression((out_regular.predictions.squeeze(), out_regular.label_ids.squeeze()))
-                test_metrics_kept    = compute_metrics_regression((out_kept.predictions.squeeze(),    out_kept.label_ids.squeeze()))
-                print(f"KEPT   dataset, randomly sampled model, disagreement {disagreement} (threshold {threshold}):", test_metrics_regular)
-                print(f"KEPT   dataset, kept-only        model, disagreement {disagreement} (threshold {threshold}):", test_metrics_kept)
-
+                
                 out_regular = trainer_regular.predict(TokenizedSentencesDataset(tokenizer, test_df_disagreement, "arrow_sentence"))
-                out_kept    = trainer_kept.predict(TokenizedSentencesDataset(tokenizer, test_df_disagreement, "arrow_sentence"))
-                test_metrics_regular = compute_metrics_regression((out_regular.predictions.squeeze(), out_regular.label_ids.squeeze()))
-                test_metrics_kept    = compute_metrics_regression((out_kept.predictions.squeeze(),    out_kept.label_ids.squeeze()))
-                print(f"ENTIRE dataset, randomly sampled model, disagreement {disagreement} (threshold {threshold}):", test_metrics_regular)
-                print(f"ENTIRE dataset, kept-only        model, disagreement {disagreement} (threshold {threshold}):", test_metrics_kept)
-            except Exception as e:
-                print(e)
+
+                out_kept      = { "predictions": np.array([], dtype=float), "label_ids": np.array([], dtype=float) }
+                out_discarded = { "predictions": np.array([], dtype=float), "label_ids": np.array([], dtype=float) }
+
+                if len(test_df_kept_disagreement) != 0:
+                    out_kept = trainer_kept.predict(TokenizedSentencesDataset(tokenizer, test_df_kept_disagreement, "arrow_sentence"))._asdict()
+                if len(test_df_discarded_disagreement) != 0:
+                    out_discarded = trainer_discarded.predict(TokenizedSentencesDataset(tokenizer, test_df_discarded_disagreement, "arrow_sentence"))._asdict()
+
+                out_combined_predictions = np.concatenate([out_kept["predictions"].squeeze(), out_discarded["predictions"].squeeze()])
+                out_combined_label_ids   = np.concatenate([out_kept["label_ids"].squeeze(),   out_discarded["label_ids"].squeeze()])
+
+                test_metrics_regular  = compute_metrics_regression((out_regular.predictions.squeeze(), out_regular.label_ids.squeeze()))
+                test_metrics_combined = compute_metrics_regression((out_combined_predictions, out_combined_label_ids))
+                print(f"ENTIRE dataset, regular  model,  disagreement {disagreement} (threshold {threshold}):", test_metrics_regular)
+                print(f"ENTIRE dataset, combined models, disagreement {disagreement} (threshold {threshold}):", test_metrics_combined)
 
         # like above, but for a few meanGrade buckets
         for bucket in [0.25, 0.75, 1.25, 1.75, 2.25, 2.75]:
             mean_grade_from = bucket - 0.25
             mean_grade_to   = bucket + 0.25
 
-            test_df_kept_bucket = test_df_kept[(test_df_kept["meanGrade"] >= mean_grade_from) & (test_df_kept["meanGrade"] <= mean_grade_to)]
-            test_df_bucket      = test_df[(test_df["meanGrade"] >= mean_grade_from) & (test_df["meanGrade"] <= mean_grade_to)]
-            if len(test_df_kept_bucket) == 0 or len(test_df_bucket) == 0:
+            test_df_bucket           = test_df          [(test_df          ["meanGrade"] >= mean_grade_from) & (test_df          ["meanGrade"] <= mean_grade_to)]
+            test_df_kept_bucket      = test_df_kept     [(test_df_kept     ["meanGrade"] >= mean_grade_from) & (test_df_kept     ["meanGrade"] <= mean_grade_to)]
+            test_df_discarded_bucket = test_df_discarded[(test_df_discarded["meanGrade"] >= mean_grade_from) & (test_df_discarded["meanGrade"] <= mean_grade_to)]
+            
+            if len(test_df_bucket) == 0:
                 continue
 
-            out_regular = trainer_regular.predict(TokenizedSentencesDataset(tokenizer, test_df_kept_bucket, "arrow_sentence"))
-            out_kept    = trainer_kept.predict(TokenizedSentencesDataset(tokenizer, test_df_kept_bucket, "arrow_sentence"))
-            test_metrics_regular = compute_metrics_regression((out_regular.predictions.squeeze(), out_regular.label_ids.squeeze()))
-            test_metrics_kept    = compute_metrics_regression((out_kept.predictions.squeeze(),    out_kept.label_ids.squeeze()))
-            print(f"KEPT   dataset, randomly sampled model, meanGrade {mean_grade_from}-{mean_grade_to} (threshold {threshold}):", test_metrics_regular)
-            print(f"KEPT   dataset, kept-only        model, meanGrade {mean_grade_from}-{mean_grade_to} (threshold {threshold}):", test_metrics_kept)
-
             out_regular = trainer_regular.predict(TokenizedSentencesDataset(tokenizer, test_df_bucket, "arrow_sentence"))
-            out_kept    = trainer_kept.predict(TokenizedSentencesDataset(tokenizer, test_df_bucket, "arrow_sentence"))
-            test_metrics_regular = compute_metrics_regression((out_regular.predictions.squeeze(), out_regular.label_ids.squeeze()))
-            test_metrics_kept    = compute_metrics_regression((out_kept.predictions.squeeze(),    out_kept.label_ids.squeeze()))
-            print(f"ENTIRE dataset, randomly sampled model, meanGrade {mean_grade_from}-{mean_grade_to} (threshold {threshold}):", test_metrics_regular)
-            print(f"ENTIRE dataset, kept-only        model, meanGrade {mean_grade_from}-{mean_grade_to} (threshold {threshold}):", test_metrics_kept)
 
+            out_kept      = { "predictions": np.array([], dtype=float), "label_ids": np.array([], dtype=float) }
+            out_discarded = { "predictions": np.array([], dtype=float), "label_ids": np.array([], dtype=float) }
+            
+            if len(test_df_kept_bucket) != 0:
+                out_kept = trainer_kept.predict(TokenizedSentencesDataset(tokenizer, test_df_kept_bucket, "arrow_sentence"))._asdict()
+            if len(test_df_discarded_bucket) != 0:
+                out_discarded = trainer_discarded.predict(TokenizedSentencesDataset(tokenizer, test_df_discarded_bucket, "arrow_sentence"))._asdict()
+
+            out_combined_predictions = np.concatenate([out_kept["predictions"].squeeze(), out_discarded["predictions"].squeeze()])
+            out_combined_label_ids   = np.concatenate([out_kept["label_ids"].squeeze(),   out_discarded["label_ids"].squeeze()])
+
+            test_metrics_regular  = compute_metrics_regression((out_regular.predictions.squeeze(), out_regular.label_ids.squeeze()))
+            test_metrics_combined = compute_metrics_regression((out_combined_predictions, out_combined_label_ids))
+            print(f"ENTIRE dataset, regular  model,  meanGrade {mean_grade_from}-{mean_grade_to} (threshold {threshold}):", test_metrics_regular)
+            print(f"ENTIRE dataset, combined models, meanGrade {mean_grade_from}-{mean_grade_to} (threshold {threshold}):", test_metrics_combined)
 
 
 
